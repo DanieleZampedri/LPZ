@@ -1,6 +1,5 @@
 """
 gui.py — Interfaccia grafica per getFV.py
-Avvia tramite Automator o doppio click su Aggiorna Valori.command
 """
 
 import queue
@@ -11,18 +10,17 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Optional
-
-# — importa la logica di getFV dalla stessa cartella —
-sys.path.insert(0, str(Path(__file__).parent))
-import getFV as core
-from openpyxl import load_workbook
 import random
 
-# ─────────────────────────────────────────────
-# Palette
-# ─────────────────────────────────────────────
+HERE = Path(__file__).parent.resolve()
+sys.path.insert(0, str(HERE))
+import getFV as core
+from openpyxl import load_workbook
+
+# ── palette ─────────────────────────────────────────────────────────────────
 BG        = "#0f1117"
 SURFACE   = "#1a1d27"
+SURFACE2  = "#212435"
 BORDER    = "#2a2d3a"
 GREEN     = "#00c896"
 GREEN_DIM = "#00856a"
@@ -31,32 +29,40 @@ TEXT      = "#e8eaf0"
 MUTED     = "#6b7280"
 TICKER_FG = "#a5b4fc"
 
-FONT_TITLE  = ("Helvetica Neue", 15, "bold")
-FONT_COUNT  = ("Helvetica Neue", 32, "bold")
-FONT_TICKER = ("Helvetica Neue", 12)
-FONT_SMALL  = ("Helvetica Neue", 10)
-FONT_MONO   = ("Menlo", 10)
-FONT_BTN    = ("Helvetica Neue", 12, "bold")
+FT = ("Helvetica Neue", 15, "bold")
+FC = ("Helvetica Neue", 28, "bold")
+FK = ("Helvetica Neue", 12)
+FS = ("Helvetica Neue", 10)
+FM = ("Menlo", 10)
+FB = ("Helvetica Neue", 12, "bold")
+FL = ("Helvetica Neue", 11)
 
-# ─────────────────────────────────────────────
-# Conteggio ticker prima del run
-# ─────────────────────────────────────────────
+# ── lettura fogli disponibili ────────────────────────────────────────────────
 
-def count_total_tickers() -> tuple[int, str]:
-    """
-    Conta i ticker nel file Excel.
-    Restituisce (conteggio, messaggio_errore).
-    """
+def get_available_sheets() -> list[str]:
+    """Restituisce i fogli del file Excel escludendo quelli in SHEETS_TO_SKIP."""
+    if not core.EXCEL_FILE_PATH.exists():
+        return []
+    try:
+        wb = load_workbook(core.EXCEL_FILE_PATH, read_only=True)
+        sheets = [s for s in wb.sheetnames if s not in core.SHEETS_TO_SKIP]
+        wb.close()
+        return sheets
+    except Exception:
+        return []
+
+# ── conteggio ticker per i fogli selezionati ─────────────────────────────────
+
+def count_tickers_in_sheets(selected: list[str]) -> tuple[int, str]:
     if not core.EXCEL_FILE_PATH.exists():
         return 0, f"File non trovato:\n{core.EXCEL_FILE_PATH}"
     try:
-        wb = load_workbook(core.EXCEL_FILE_PATH, read_only=True)
+        wb    = load_workbook(core.EXCEL_FILE_PATH, read_only=True)
         total = 0
-        for sheet_name in wb.sheetnames:
-            if sheet_name in core.SHEETS_TO_SKIP:
+        for name in selected:
+            if name not in wb.sheetnames:
                 continue
-            ws = wb[sheet_name]
-            for row in ws.iter_rows(min_row=5, min_col=3, max_col=3, values_only=True):
+            for row in wb[name].iter_rows(min_row=5, min_col=3, max_col=3, values_only=True):
                 if row[0] is not None and str(row[0]).strip():
                     total += 1
         wb.close()
@@ -64,24 +70,17 @@ def count_total_tickers() -> tuple[int, str]:
     except Exception as e:
         return 0, str(e)
 
-# ─────────────────────────────────────────────
-# Worker — process_sheets con callback GUI
-# ─────────────────────────────────────────────
+# ── worker ───────────────────────────────────────────────────────────────────
 
 def run_worker(
     q: queue.Queue,
     stop_event: threading.Event,
+    selected_sheets: list[str],
     dry_run: bool = False,
 ) -> None:
-    """
-    Esegue l'elaborazione in un thread secondario.
-    Comunica con la GUI esclusivamente tramite la queue q.
-    Non chiama mai sys.exit() — usa q.put(("error", msg)) per gli errori.
-    """
     def put(*args):
         q.put(args)
 
-    # — validazione cookie manuale (non sys.exit) —
     if not core.COOKIE or not core.COOKIE.strip():
         put("error", "Cookie non trovato.\nImposta COOKIE nel file .env")
         return
@@ -92,44 +91,45 @@ def run_worker(
 
     try:
         session = core.create_session()
-        wb = load_workbook(core.EXCEL_FILE_PATH)
+        wb      = load_workbook(core.EXCEL_FILE_PATH)
 
         for sheet_name in wb.sheetnames:
             if stop_event.is_set():
                 break
-            if sheet_name in core.SHEETS_TO_SKIP:
+            # salta se non selezionato o in SHEETS_TO_SKIP
+            if sheet_name not in selected_sheets:
                 continue
 
-            ws = wb[sheet_name]
+            ws     = wb[sheet_name]
             offset = core.SHEET_COLUMN_OFFSET.get(sheet_name, 0)
 
             tickers: list[tuple[int, str]] = []
-            for row_idx, row in enumerate(
+            for idx, row in enumerate(
                 ws.iter_rows(min_row=5, min_col=3, max_col=3, values_only=True), start=5
             ):
-                val = row[0]
-                if val is not None and str(val).strip():
-                    tickers.append((row_idx, str(val).strip()))
+                if row[0] is not None and str(row[0]).strip():
+                    tickers.append((idx, str(row[0]).strip()))
 
             if not tickers:
                 continue
 
             put("status", f"Sheet: {sheet_name}  —  {len(tickers)} ticker")
 
-            for batch_start in range(0, len(tickers), core.BATCH_SIZE):
+            for b_start in range(0, len(tickers), core.BATCH_SIZE):
                 if stop_event.is_set():
                     break
-                batch = tickers[batch_start: batch_start + core.BATCH_SIZE]
-
-                for row_number, ticker in batch:
+                for row_num, ticker in tickers[b_start: b_start + core.BATCH_SIZE]:
                     if stop_event.is_set():
                         break
-
                     put("ticker_start", ticker)
-                    result = core.extract_all(ticker, session)
+                    try:
+                        result = core.extract_all(ticker, session)
+                    except Exception as e:
+                        result = None
+                        put("log_err", f"[{ticker}] errore imprevisto: {e}")
 
                     if result is not None:
-                        core.write_result(ws, row_number, result, offset, dry_run)
+                        core.write_result(ws, row_num, result, offset, dry_run)
                         put("ticker_done", ticker, True)
                     else:
                         put("ticker_done", ticker, False)
@@ -139,7 +139,7 @@ def run_worker(
                 if not dry_run and not stop_event.is_set():
                     wb.save(core.EXCEL_FILE_PATH)
 
-                if batch_start + core.BATCH_SIZE < len(tickers) and not stop_event.is_set():
+                if b_start + core.BATCH_SIZE < len(tickers) and not stop_event.is_set():
                     wait = random.uniform(core.BATCH_WAIT_MIN, core.BATCH_WAIT_MAX)
                     put("status", f"Pausa batch — {wait:.0f}s...")
                     time.sleep(wait)
@@ -152,9 +152,7 @@ def run_worker(
     except Exception as e:
         put("error", str(e))
 
-# ─────────────────────────────────────────────
-# GUI
-# ─────────────────────────────────────────────
+# ── GUI ──────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
 
@@ -164,159 +162,242 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.resizable(False, False)
 
-        self._q: queue.Queue      = queue.Queue()
-        self._stop                = threading.Event()
+        self._q      = queue.Queue()
+        self._stop   = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        self._total      = 0
-        self._done       = 0
-        self._errors     = 0
-        self._t_start: Optional[float] = None
+        self._total  = 0
+        self._done   = 0
+        self._errors = 0
+        self._t0: Optional[float] = None
+
+        # variabili checkbox fogli
+        self._sheet_vars: dict[str, tk.BooleanVar] = {}
+        self._select_all_var = tk.BooleanVar(value=True)
 
         self._build()
-        self._load_total()
+        self._load_sheets()
         self._poll()
 
-    # ── build ────────────────────────────────
+    # ── costruzione UI ───────────────────────────────────────────────────────
 
     def _build(self):
-        W = 520
-        self.geometry(f"{W}x640")
+        self.geometry("520x760")
 
-        root = tk.Frame(self, bg=BG)
-        root.pack(fill="both", expand=True, padx=28, pady=24)
+        f = tk.Frame(self, bg=BG)
+        f.pack(fill="both", expand=True, padx=28, pady=20)
 
         # header
-        hdr = tk.Frame(root, bg=BG)
-        hdr.pack(fill="x", pady=(0, 20))
-        tk.Label(hdr, text="LPZ Investing", font=FONT_TITLE,
-                 bg=BG, fg=TEXT).pack(side="left")
-        self._badge = tk.Label(hdr, text="pronto", font=FONT_SMALL,
-                               bg=SURFACE, fg=MUTED, padx=10, pady=3)
+        hdr = tk.Frame(f, bg=BG)
+        hdr.pack(fill="x", pady=(0, 16))
+        tk.Label(hdr, text="LPZ Investing", font=FT, bg=BG, fg=TEXT).pack(side="left")
+        self._badge = tk.Label(hdr, text="pronto", font=FS,
+                               bg=SURFACE, fg=MUTED, padx=10, pady=4)
         self._badge.pack(side="right")
 
-        # card contatore
-        card = tk.Frame(root, bg=SURFACE, highlightbackground=BORDER,
+        # ── sezione selezione fogli ──
+        sheets_card = tk.Frame(f, bg=SURFACE, highlightbackground=BORDER,
+                               highlightthickness=1)
+        sheets_card.pack(fill="x", pady=(0, 12))
+
+        sheets_header = tk.Frame(sheets_card, bg=SURFACE)
+        sheets_header.pack(fill="x", padx=16, pady=(12, 6))
+
+        tk.Label(sheets_header, text="Fogli da aggiornare",
+                 font=("Helvetica Neue", 11, "bold"),
+                 bg=SURFACE, fg=TEXT).pack(side="left")
+
+        # checkbox seleziona tutto
+        cb_all = tk.Checkbutton(
+            sheets_header, text="Seleziona tutto",
+            variable=self._select_all_var,
+            font=FS, bg=SURFACE, fg=MUTED,
+            activebackground=SURFACE, activeforeground=TEXT,
+            selectcolor=SURFACE2,
+            relief="flat", cursor="hand2",
+            command=self._on_select_all
+        )
+        cb_all.pack(side="right")
+
+        # separatore
+        tk.Frame(sheets_card, bg=BORDER, height=1).pack(fill="x", padx=16)
+
+        # contenitore scrollabile per i fogli
+        self._sheets_frame = tk.Frame(sheets_card, bg=SURFACE)
+        self._sheets_frame.pack(fill="x", padx=16, pady=(6, 12))
+
+        # ── card contatore ──
+        card = tk.Frame(f, bg=SURFACE, highlightbackground=BORDER,
                         highlightthickness=1)
-        card.pack(fill="x", pady=(0, 16))
+        card.pack(fill="x", pady=(0, 12))
         inner = tk.Frame(card, bg=SURFACE)
-        inner.pack(padx=20, pady=18)
-
-        self._lbl_count = tk.Label(inner, text="— / —",
-                                   font=FONT_COUNT, bg=SURFACE, fg=TEXT)
+        inner.pack(padx=20, pady=14)
+        self._lbl_count = tk.Label(inner, text="— / —", font=FC,
+                                   bg=SURFACE, fg=TEXT)
         self._lbl_count.pack()
-
         self._lbl_ticker = tk.Label(inner, text="In attesa di avvio…",
-                                    font=FONT_TICKER, bg=SURFACE, fg=TICKER_FG)
+                                    font=FK, bg=SURFACE, fg=TICKER_FG)
         self._lbl_ticker.pack(pady=(4, 0))
 
-        # barra
-        bar_frame = tk.Frame(root, bg=BG)
-        bar_frame.pack(fill="x", pady=(0, 6))
-
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("lpz.Horizontal.TProgressbar",
-                         troughcolor=SURFACE, background=GREEN,
-                         bordercolor=BG, lightcolor=GREEN, darkcolor=GREEN,
-                         thickness=6)
-        self._bar = ttk.Progressbar(bar_frame, orient="horizontal",
-                                     length=W - 56, mode="determinate",
-                                     style="lpz.Horizontal.TProgressbar")
+        # progressbar
+        bf = tk.Frame(f, bg=BG)
+        bf.pack(fill="x", pady=(0, 6))
+        sty = ttk.Style(self)
+        sty.theme_use("clam")
+        sty.configure("lpz.Horizontal.TProgressbar",
+                       troughcolor=SURFACE, background=GREEN,
+                       bordercolor=BG, lightcolor=GREEN, darkcolor=GREEN,
+                       thickness=6)
+        self._bar = ttk.Progressbar(bf, orient="horizontal", length=464,
+                                    mode="determinate",
+                                    style="lpz.Horizontal.TProgressbar")
         self._bar.pack()
 
-        # tempo
-        time_row = tk.Frame(root, bg=BG)
-        time_row.pack(fill="x", pady=(6, 0))
-        self._lbl_elapsed   = tk.Label(time_row, text="Trascorso  —",
-                                       font=FONT_SMALL, bg=BG, fg=MUTED)
-        self._lbl_remaining = tk.Label(time_row, text="Rimanente  —",
-                                       font=FONT_SMALL, bg=BG, fg=MUTED)
-        self._lbl_elapsed.pack(side="left")
-        self._lbl_remaining.pack(side="right")
+        # tempi
+        tf = tk.Frame(f, bg=BG)
+        tf.pack(fill="x", pady=(6, 2))
+        self._lbl_el  = tk.Label(tf, text="Trascorso  —", font=FS, bg=BG, fg=MUTED)
+        self._lbl_rem = tk.Label(tf, text="Rimanente  —", font=FS, bg=BG, fg=MUTED)
+        self._lbl_el.pack(side="left")
+        self._lbl_rem.pack(side="right")
 
         # status
-        self._lbl_status = tk.Label(root, text="",
-                                    font=FONT_SMALL, bg=BG, fg=MUTED,
-                                    anchor="w")
-        self._lbl_status.pack(fill="x", pady=(8, 0))
+        self._lbl_st = tk.Label(f, text="", font=FS, bg=BG, fg=MUTED, anchor="w")
+        self._lbl_st.pack(fill="x", pady=(6, 0))
 
         # log
-        log_outer = tk.Frame(root, bg=SURFACE, highlightbackground=BORDER,
-                             highlightthickness=1)
-        log_outer.pack(fill="x", pady=(12, 0))
-
-        self._log = tk.Text(log_outer, width=58, height=10,
-                            font=FONT_MONO, bg=SURFACE, fg="#9ca3af",
-                            insertbackground=TEXT, relief="flat",
-                            state="disabled", wrap="none",
-                            padx=14, pady=10)
+        lf = tk.Frame(f, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        lf.pack(fill="x", pady=(10, 0))
+        self._log = tk.Text(lf, width=56, height=7, font=FM,
+                            bg=SURFACE, fg="#9ca3af",
+                            relief="flat", state="disabled",
+                            wrap="none", padx=14, pady=8)
         self._log.pack(side="left", fill="both", expand=True)
-
-        sb = tk.Scrollbar(log_outer, orient="vertical",
-                          command=self._log.yview, bg=SURFACE,
-                          troughcolor=SURFACE, width=8)
+        sb = tk.Scrollbar(lf, orient="vertical", command=self._log.yview,
+                          bg=SURFACE, troughcolor=SURFACE, width=8)
         sb.pack(side="right", fill="y")
         self._log.config(yscrollcommand=sb.set)
-
         self._log.tag_config("ok",  foreground=GREEN)
         self._log.tag_config("err", foreground=RED)
         self._log.tag_config("inf", foreground=MUTED)
         self._log.tag_config("ts",  foreground="#374151")
 
         # bottoni
-        btn_row = tk.Frame(root, bg=BG)
-        btn_row.pack(fill="x", pady=(20, 0))
-
-        self._btn_start = tk.Button(
-            btn_row, text="Avvia aggiornamento",
-            font=FONT_BTN, bg=GREEN, fg="#0a0f0d",
+        br = tk.Frame(f, bg=BG)
+        br.pack(fill="x", pady=(16, 0))
+        self._btn_go = tk.Button(
+            br, text="Avvia aggiornamento", font=FB,
+            bg=GREEN, fg="#0a0f0d",
             activebackground=GREEN_DIM, activeforeground="#0a0f0d",
             relief="flat", padx=20, pady=10, cursor="hand2",
             command=self._on_start
         )
-        self._btn_start.pack(side="left", fill="x", expand=True, padx=(0, 8))
-
+        self._btn_go.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self._btn_stop = tk.Button(
-            btn_row, text="Interrompi",
-            font=FONT_BTN, bg=BORDER, fg=MUTED,
+            br, text="Interrompi", font=FB,
+            bg=BORDER, fg=MUTED,
             activebackground="#3a3d4a", activeforeground=TEXT,
             relief="flat", padx=20, pady=10, cursor="hand2",
             state="disabled", command=self._on_stop
         )
         self._btn_stop.pack(side="left", fill="x", expand=True)
 
-    # ── logica ───────────────────────────────
+    # ── caricamento fogli ────────────────────────────────────────────────────
 
-    def _load_total(self):
-        self._log_line("Lettura file Excel…", "inf")
+    def _load_sheets(self):
+        self._log_ln("Lettura file Excel…", "inf")
         def _work():
-            total, err = count_total_tickers()
-            self._q.put(("total", total, err))
+            sheets = get_available_sheets()
+            self._q.put(("sheets_loaded", sheets))
         threading.Thread(target=_work, daemon=True).start()
 
+    def _populate_sheets(self, sheets: list[str]):
+        """Popola il frame con una checkbox per ogni foglio."""
+        for widget in self._sheets_frame.winfo_children():
+            widget.destroy()
+        self._sheet_vars.clear()
+
+        if not sheets:
+            tk.Label(self._sheets_frame, text="Nessun foglio trovato",
+                     font=FS, bg=SURFACE, fg=RED).pack(anchor="w")
+            return
+
+        # griglia a 2 colonne
+        for i, sheet in enumerate(sheets):
+            var = tk.BooleanVar(value=True)
+            self._sheet_vars[sheet] = var
+            cb = tk.Checkbutton(
+                self._sheets_frame,
+                text=sheet,
+                variable=var,
+                font=FL, bg=SURFACE, fg=TEXT,
+                activebackground=SURFACE, activeforeground=TEXT,
+                selectcolor=SURFACE2,
+                relief="flat", cursor="hand2",
+                command=self._on_sheet_toggle
+            )
+            col = i % 2
+            row = i // 2
+            cb.grid(row=row, column=col, sticky="w", padx=(0, 20), pady=2)
+
+        # aggiorna contatore
+        self._refresh_count_async()
+
+    def _on_select_all(self):
+        val = self._select_all_var.get()
+        for var in self._sheet_vars.values():
+            var.set(val)
+        self._refresh_count_async()
+
+    def _on_sheet_toggle(self):
+        """Aggiorna lo stato di 'seleziona tutto' in base alle checkbox."""
+        all_checked = all(v.get() for v in self._sheet_vars.values())
+        none_checked = not any(v.get() for v in self._sheet_vars.values())
+        if all_checked:
+            self._select_all_var.set(True)
+        elif none_checked:
+            self._select_all_var.set(False)
+        self._refresh_count_async()
+
+    def _refresh_count_async(self):
+        """Aggiorna il contatore ticker in background al cambio selezione."""
+        selected = self._selected_sheets()
+        def _work():
+            total, err = count_tickers_in_sheets(selected)
+            self._q.put(("count_update", total, err))
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _selected_sheets(self) -> list[str]:
+        return [s for s, v in self._sheet_vars.items() if v.get()]
+
+    # ── logica avvio/stop ────────────────────────────────────────────────────
+
     def _on_start(self):
+        selected = self._selected_sheets()
+        if not selected:
+            messagebox.showwarning("Attenzione", "Seleziona almeno un foglio.")
+            return
         if self._total == 0:
             messagebox.showwarning(
-                "File non trovato",
-                f"Nessun ticker trovato.\nControlla il percorso:\n{core.EXCEL_FILE_PATH}"
+                "Attenzione",
+                f"Nessun ticker trovato nei fogli selezionati.\n"
+                f"Percorso: {core.EXCEL_FILE_PATH}"
             )
             return
 
         self._stop.clear()
-        self._done = 0
-        self._errors = 0
-        self._t_start = time.time()
-        self._bar["value"] = 0
+        self._done = self._errors = 0
+        self._t0 = time.time()
+        self._bar["value"]   = 0
         self._bar["maximum"] = self._total
-        self._set_badge("in corso", GREEN)
-        self._btn_start.config(state="disabled")
+        self._badge.config(text="in corso", fg=GREEN)
+        self._btn_go.config(state="disabled")
         self._btn_stop.config(state="normal", bg="#3a1a1a", fg=RED)
-        self._log_line("Avvio elaborazione…", "inf")
+        self._log_ln(f"Avvio su {len(selected)} fogli…", "inf")
 
         self._thread = threading.Thread(
             target=run_worker,
-            args=(self._q, self._stop),
+            args=(self._q, self._stop, selected),
             daemon=True
         )
         self._thread.start()
@@ -324,91 +405,90 @@ class App(tk.Tk):
     def _on_stop(self):
         self._stop.set()
         self._btn_stop.config(state="disabled")
-        self._log_line("Interruzione in corso…", "inf")
+        self._log_ln("Interruzione in corso…", "inf")
+
+    # ── poll & dispatch ──────────────────────────────────────────────────────
 
     def _poll(self):
         try:
             while True:
-                msg = self._q.get_nowait()
-                self._dispatch(msg)
+                self._dispatch(self._q.get_nowait())
         except queue.Empty:
             pass
         self.after(80, self._poll)
 
     def _dispatch(self, msg: tuple):
-        kind = msg[0]
+        k = msg[0]
 
-        if kind == "total":
+        if k == "sheets_loaded":
+            sheets = msg[1]
+            self._populate_sheets(sheets)
+            self._log_ln(f"{len(sheets)} fogli disponibili.", "inf")
+
+        elif k == "count_update":
             _, total, err = msg
             self._total = total
             if err:
-                self._log_line(f"Errore lettura: {err}", "err")
                 self._lbl_count.config(text="Errore")
+                self._log_ln(f"Errore conteggio: {err}", "err")
             else:
                 self._lbl_count.config(text=f"0 / {total}")
-                self._log_line(f"{total} ticker trovati.", "inf")
 
-        elif kind == "ticker_start":
-            _, ticker = msg
-            self._lbl_ticker.config(text=ticker)
+        elif k == "ticker_start":
+            self._lbl_ticker.config(text=msg[1])
 
-        elif kind == "ticker_done":
+        elif k == "ticker_done":
             _, ticker, ok = msg
             self._done += 1
             if not ok:
                 self._errors += 1
             self._bar["value"] = self._done
             self._lbl_count.config(text=f"{self._done} / {self._total}")
-            self._log_line(
-                f"{'✓' if ok else '✗'}  {ticker}",
-                "ok" if ok else "err"
-            )
-            self._refresh_time()
+            self._log_ln(f"{'✓' if ok else '✗'}  {ticker}", "ok" if ok else "err")
+            self._tick_time()
 
-        elif kind == "status":
-            _, txt = msg
-            self._lbl_status.config(text=txt)
+        elif k == "status":
+            self._lbl_st.config(text=msg[1])
 
-        elif kind == "done":
-            self._finish(interrupted=False)
+        elif k == "log_err":
+            self._log_ln(msg[1], "err")
 
-        elif kind == "error":
-            _, err = msg
-            self._log_line(f"ERRORE: {err}", "err")
-            messagebox.showerror("Errore", err)
-            self._finish(interrupted=True)
+        elif k == "done":
+            self._finish(False)
+
+        elif k == "error":
+            self._log_ln(f"ERRORE: {msg[1]}", "err")
+            messagebox.showerror("Errore", msg[1])
+            self._finish(True)
 
     def _finish(self, interrupted: bool):
-        self._btn_start.config(state="normal")
+        self._btn_go.config(state="normal")
         self._btn_stop.config(state="disabled", bg=BORDER, fg=MUTED)
-        label = "interrotto" if interrupted else "completato"
-        self._set_badge(label, MUTED)
+        self._badge.config(
+            text="interrotto" if interrupted else "completato", fg=MUTED
+        )
         self._lbl_ticker.config(text="Operazione terminata")
         summary = f"{self._done} elaborati  ·  {self._errors} errori"
-        self._lbl_status.config(text=summary)
-        self._log_line(f"— {summary} —", "inf")
+        self._lbl_st.config(text=summary)
+        self._log_ln(f"— {summary} —", "inf")
 
-    def _refresh_time(self):
-        if not self._t_start or self._done == 0:
+    def _tick_time(self):
+        if not self._t0 or self._done == 0:
             return
-        elapsed = time.time() - self._t_start
-        avg = elapsed / self._done
-        remaining = avg * (self._total - self._done)
-        self._lbl_elapsed.config(text=f"Trascorso  {self._fmt(elapsed)}")
-        self._lbl_remaining.config(text=f"Rimanente  {self._fmt(remaining)}")
+        el  = time.time() - self._t0
+        rem = (el / self._done) * (self._total - self._done)
+        self._lbl_el.config( text=f"Trascorso   {self._fmt(el)}")
+        self._lbl_rem.config(text=f"Rimanente   {self._fmt(rem)}")
 
     @staticmethod
-    def _fmt(sec: float) -> str:
-        h, rem = divmod(int(sec), 3600)
-        m, s   = divmod(rem, 60)
-        if h:   return f"{h}h {m:02d}m"
-        if m:   return f"{m}m {s:02d}s"
-        return  f"{s}s"
+    def _fmt(s: float) -> str:
+        h, r = divmod(int(s), 3600)
+        m, s = divmod(r, 60)
+        if h: return f"{h}h {m:02d}m"
+        if m: return f"{m}m {s:02d}s"
+        return f"{s}s"
 
-    def _set_badge(self, text: str, color: str):
-        self._badge.config(text=text, fg=color)
-
-    def _log_line(self, text: str, tag: str = ""):
+    def _log_ln(self, text: str, tag: str = ""):
         self._log.config(state="normal")
         ts = time.strftime("%H:%M:%S")
         self._log.insert("end", f"[{ts}]  ", "ts")
@@ -417,10 +497,7 @@ class App(tk.Tk):
         self._log.config(state="disabled")
 
 
-# ─────────────────────────────────────────────
-# Entrypoint
-# ─────────────────────────────────────────────
+# ── entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()

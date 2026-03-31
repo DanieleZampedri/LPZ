@@ -14,9 +14,6 @@ from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 import os
 
-# ---------------------------------------------------------------------------
-# Configurazione centralizzata
-# ---------------------------------------------------------------------------
 
 EXCEL_FILE_PATH = Path("../excel/Valuation Model LPZ Investing.xlsx")
 LOG_FILE = Path("getFV.log")
@@ -43,10 +40,14 @@ query loadModel ($slug: String!, $ticker: String!) {
 
 # Slug dei due workbook
 SLUG_DCF    = "dcf-growth-exit-5yr"
-SLUG_EBITDA = "dcf-ebitda-exit-5yr"
+SLUG_EBITDA = "ebitda-multiples"
 
 # Fogli da saltare
 SHEETS_TO_SKIP: set[str] = {
+    "TOTAL SCORES",
+    "Set up",
+    "Company names",
+    "Database"
 }
 
 # Offset di colonna per-sheet (0 = nessun offset)
@@ -62,29 +63,34 @@ COLUMN_MAP = {
     "ebitda_gp":  26,
     "ebitda_gnp": 29,
     "fcf":        32,
+    "net_debt":   35,
 }
+
 
 # Celle del workbook DCF da leggere
 DCF_SHEET = "5 Year DCF - Growth Exit"
 CELLS = {
     "ebitda_gpn_v1": "E368",
     "ebitda_gpn_v5": "I368",
-    "ebitda_gp_v1":  "D106",
-    "ebitda_gp_v5":  "H106",
 }
+
+EBITDA_GP_V1_CELLS = [f"D{r}" for r in range(256, 269)] + ["D254","D96"]
+EBITDA_GP_V5_CELLS = [f"I{r}" for r in range(256, 269)] + ["I254", "I96"]
+NET_DEBT_DEBT_CELL = "E224"
+NET_DEBT_CASH_CELL = "E222"
 
 BATCH_SIZE            = 30
 MAX_ATTEMPTS          = 3
 RATE_LIMIT_BASE_WAIT  = 30   # secondi base in caso di 429
 
-BATCH_WAIT_MIN        = 5   # attesa tra un batch e il successivo
-BATCH_WAIT_MAX        = 15
+BATCH_WAIT_MIN        = 4   # attesa tra un batch e il successivo
+BATCH_WAIT_MAX        = 6
 
-TICKER_DELAY_MIN      = 0.3  # attesa tra un ticker e il successivo
-TICKER_DELAY_MAX      = 1.0
+TICKER_DELAY_MIN      = 0.5 # attesa tra un ticker e il successivo
+TICKER_DELAY_MAX      = 0.7
 
 INTRA_TICKER_DELAY_MIN = 0.3  # attesa tra chiamata DCF e chiamata EV/EBITDA
-INTRA_TICKER_DELAY_MAX = 1.0  # dello stesso ticker
+INTRA_TICKER_DELAY_MAX = 0.6  # dello stesso ticker
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -100,7 +106,7 @@ def setup_logging() -> logging.Logger:
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
 
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8", mode="w")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
@@ -111,10 +117,6 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-# ---------------------------------------------------------------------------
-# Validazione
-# ---------------------------------------------------------------------------
-
 def validate_cookie() -> None:
     """Verifica che il cookie sia presente; termina lo script altrimenti."""
     if not COOKIE or COOKIE.strip() == "":
@@ -124,9 +126,6 @@ def validate_cookie() -> None:
         sys.exit(1)
     logger.debug("Cookie trovato (lunghezza %d caratteri).", len(COOKIE))
 
-# ---------------------------------------------------------------------------
-# HTTP session
-# ---------------------------------------------------------------------------
 
 def create_session() -> requests.Session:
     session = requests.Session()
@@ -141,15 +140,10 @@ def create_session() -> requests.Session:
     session.mount("http://", adapter)
     return session
 
-# ---------------------------------------------------------------------------
-# Conversione valuta
-# ---------------------------------------------------------------------------
 
 _converter = CurrencyConverter()
 
-
 def to_usd(amount: float, currency: str) -> float:
-    """Converte `amount` dalla valuta indicata a USD."""
     if currency.upper() == "USD":
         return float(amount)
     try:
@@ -158,12 +152,8 @@ def to_usd(amount: float, currency: str) -> float:
         logger.warning("Impossibile convertire %s -> USD: %s. Valore non convertito.", currency, e)
         return float(amount)
 
-# ---------------------------------------------------------------------------
-# CAGR helper
-# ---------------------------------------------------------------------------
 
 def cagr(v_start: Optional[float], v_end: Optional[float], years: int = 4) -> Optional[float]:
-    
     if v_start is None or v_end is None or isinstance(v_start, str) or isinstance(v_end, str):
         return None
     if v_start == 0:
@@ -177,9 +167,37 @@ def cagr(v_start: Optional[float], v_end: Optional[float], years: int = 4) -> Op
         logger.debug("CAGR non calcolabile: %s (v_start=%s, v_end=%s).", e, v_start, v_end)
         return None
 
-# ---------------------------------------------------------------------------
-# Chiamata API generica
-# ---------------------------------------------------------------------------
+def sum_cells(dcf_cells: dict, cell_ids: list[str]) -> Optional[float]:
+    total     = 0.0
+    found_any = False
+    for cell_id in cell_ids:
+        if cell_id in dcf_cells:
+            val = dcf_cells[cell_id].get("value")
+            if val is not None and not isinstance(val, str):
+                try:
+                    total += float(val)
+                    found_any = True
+                except (TypeError, ValueError):
+                    logger.debug("Cella %s: valore non numerico (%s), ignorato.", cell_id, val)
+    return total if found_any else None
+
+def calc_net_debt(dcf_cells: dict, ebitda_gp_v5: Optional[float]) -> Optional[float]:
+    if ebitda_gp_v5 is None or ebitda_gp_v5 == 0:
+        return None
+    debt = dcf_cells.get(NET_DEBT_DEBT_CELL, {}).get("value")
+    cash = dcf_cells.get(NET_DEBT_CASH_CELL, {}).get("value")
+    if debt is None or cash is None:
+        logger.debug("calc_net_debt: cella mancante (debt=%s, cash=%s)", 
+                     NET_DEBT_DEBT_CELL, NET_DEBT_CASH_CELL)
+        return None
+    if isinstance(debt, str) or isinstance(cash, str):
+        return None
+    try:
+        logger.debug("Calcolo net debt: debt=%s, cash=%s, ebitda_gp_v5=%s", -debt, cash, ebitda_gp_v5)
+        return (-float(debt) - float(cash)) / ebitda_gp_v5
+    except (TypeError, ValueError, ZeroDivisionError) as e:
+        logger.debug("calc_net_debt non calcolabile: %s", e)
+        return None
 
 def fetch_workbook(ticker: str, slug: str, session: requests.Session) -> Optional[dict]:
    
@@ -221,12 +239,8 @@ def fetch_workbook(ticker: str, slug: str, session: requests.Session) -> Optiona
 
     return None
 
-# ---------------------------------------------------------------------------
-# Estrazione dati — workbook DCF principale
-# ---------------------------------------------------------------------------
 
 def extract_dcf(ticker: str, session: requests.Session) -> Optional[dict]:
-    """Estrae fv, ebitda_gp, ebitda_gnp, fcf dal workbook dcf-growth-exit-5yr."""
     workbook = fetch_workbook(ticker, SLUG_DCF, session)
     if workbook is None:
         return None
@@ -240,29 +254,34 @@ def extract_dcf(ticker: str, session: requests.Session) -> Optional[dict]:
             cell_id = CELLS[key]
             return dcf_cells[cell_id]["value"] if cell_id in dcf_cells else None
 
+        ebitda_gp_v1 = sum_cells(dcf_cells, EBITDA_GP_V1_CELLS)
+        ebitda_gp_v5 = sum_cells(dcf_cells, EBITDA_GP_V5_CELLS)
+
         result = {
             "fv":         named.get("fv_mid"),
-            "ebitda_gp":  cagr(cell("ebitda_gp_v1"),  cell("ebitda_gp_v5")),
+            "ebitda_gp":  cagr(ebitda_gp_v1, ebitda_gp_v5),
             "ebitda_gnp": cagr(cell("ebitda_gpn_v1"), cell("ebitda_gpn_v5")),
             "fcf":        named.get("_unlevered_fcf_5y_cagr"),
+            "net_debt":   calc_net_debt(dcf_cells, ebitda_gp_v5),
         }
 
         if currency.upper() != "USD" and result["fv"] is not None:
             result["fv"] = to_usd(result["fv"], currency)
 
         logger.debug("[%s] DCF: %s (valuta: %s)", ticker, result, currency)
+        logger.info(
+            "[%s] EBITDA GP  v1=%s  v5=%s  CAGR=%s",
+            ticker, ebitda_gp_v1, ebitda_gp_v5,
+            cagr(ebitda_gp_v1, ebitda_gp_v5)
+        )
         return result
 
     except KeyError as e:
         logger.error("[%s] KeyError nel workbook DCF: %s", ticker, e)
         return None
 
-# ---------------------------------------------------------------------------
-# Estrazione dati — workbook EV/EBITDA
-# ---------------------------------------------------------------------------
 
 def extract_ev_ebitda(ticker: str, session: requests.Session) -> Optional[float]:
-    """Estrae il fv_mid dal workbook dcf-ebitda-exit-5yr come valore EV/EBITDA."""
     workbook = fetch_workbook(ticker, SLUG_EBITDA, session)
     if workbook is None:
         return None
@@ -282,9 +301,6 @@ def extract_ev_ebitda(ticker: str, session: requests.Session) -> Optional[float]
         logger.error("[%s] KeyError nel workbook EV/EBITDA: %s", ticker, e)
         return None
 
-# ---------------------------------------------------------------------------
-# Estrazione completa per ticker (DCF + EV/EBITDA con delay intermedio)
-# ---------------------------------------------------------------------------
 
 def extract_all(ticker: str, session: requests.Session) -> Optional[dict]:
     """
@@ -313,12 +329,8 @@ def extract_all(ticker: str, session: requests.Session) -> Optional[dict]:
 
     return {**dcf, "ev_ebitda": ev_ebitda}
 
-# ---------------------------------------------------------------------------
-# Scrittura su Excel
-# ---------------------------------------------------------------------------
 
 def write_result(ws, row: int, result: dict, offset: int, dry_run: bool) -> None:
-    """Scrive i valori estratti nelle celle corrette del foglio."""
     for field, base_col in COLUMN_MAP.items():
         value = result.get(field)
         if value is not None:
@@ -329,9 +341,7 @@ def write_result(ws, row: int, result: dict, offset: int, dry_run: bool) -> None
                          ws.title, field, col, value,
                          " (dry-run, non scritto)" if dry_run else "")
 
-# ---------------------------------------------------------------------------
-# Elaborazione principale
-# ---------------------------------------------------------------------------
+
 
 def process_sheets(dry_run: bool = False) -> None:
     validate_cookie()
@@ -400,9 +410,7 @@ def process_sheets(dry_run: bool = False) -> None:
 
     logger.info("Elaborazione completata.")
 
-# ---------------------------------------------------------------------------
-# Entrypoint CLI
-# ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
